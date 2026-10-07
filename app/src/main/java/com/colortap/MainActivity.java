@@ -2,6 +2,7 @@ package com.colortap;
 
 import android.Manifest;
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.Intent;
 import android.media.projection.MediaProjectionConfig;
 import android.media.projection.MediaProjectionManager;
@@ -13,6 +14,7 @@ import android.text.TextWatcher;
 import android.view.View;
 import android.widget.CheckBox;
 import android.widget.EditText;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.SeekBar;
 import android.widget.TextView;
@@ -23,7 +25,8 @@ public class MainActivity extends Activity {
     private static final int REQ_CAPTURE = 1;
 
     private TextView status, toleranceLabel;
-    private EditText color, interval, minHits;
+    private EditText color, interval, minHits, matchPct;
+    private LinearLayout templates;
     private SeekBar tolerance;
     private LinearLayout preview;
     private CheckBox tapEachColor;
@@ -38,6 +41,8 @@ public class MainActivity extends Activity {
         color = findViewById(R.id.color);
         interval = findViewById(R.id.interval);
         minHits = findViewById(R.id.minHits);
+        matchPct = findViewById(R.id.matchPct);
+        templates = findViewById(R.id.templates);
         tolerance = findViewById(R.id.tolerance);
         preview = findViewById(R.id.preview);
         tapEachColor = findViewById(R.id.tapEachColor);
@@ -77,6 +82,8 @@ public class MainActivity extends Activity {
         tolerance.setProgress(s.tolerance);
         interval.setText(String.valueOf(s.intervalMs));
         minHits.setText(String.valueOf(s.minHits));
+        matchPct.setText(String.valueOf(s.matchPct));
+        updateTemplates();
         updateToleranceLabel();
         updatePreview();
         updateStatus();
@@ -102,6 +109,7 @@ public class MainActivity extends Activity {
         s.tolerance = tolerance.getProgress();
         s.intervalMs = parseInt(interval, 300, 50, 60_000);
         s.minHits = parseInt(minHits, 3, 1, 100);
+        s.matchPct = parseInt(matchPct, 85, 1, 100);
         s.save(this);
         return s;
     }
@@ -131,6 +139,29 @@ public class MainActivity extends Activity {
         }
     }
 
+    private void updateTemplates() {
+        templates.removeAllViews();
+        int size = (int) (56 * getResources().getDisplayMetrics().density);
+        for (Template t : Template.loadAll(this)) {
+            ImageView v = new ImageView(this);
+            v.setImageBitmap(t.toBitmap());
+            v.setScaleType(ImageView.ScaleType.FIT_CENTER);
+            v.setOnClickListener(x -> new AlertDialog.Builder(this)
+                    .setMessage("この画像を削除しますか？")
+                    .setPositiveButton("削除", (dlg, w) -> {
+                        t.file.delete();
+                        CaptureService cs = CaptureService.instance;
+                        if (cs != null) cs.reloadSettings();
+                        updateTemplates();
+                    })
+                    .setNegativeButton("キャンセル", null)
+                    .show());
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(size, size);
+            lp.setMarginEnd(size / 6);
+            templates.addView(v, lp);
+        }
+    }
+
     private int[] parseColors() {
         return com.colortap.Settings.parseColors(color.getText().toString().trim());
     }
@@ -157,8 +188,8 @@ public class MainActivity extends Activity {
             Toast.makeText(this, "すでに動作中です", Toast.LENGTH_SHORT).show();
             return;
         }
-        if (s.colors.length == 0) {
-            Toast.makeText(this, "画面の「＋色」で色を追加してください", Toast.LENGTH_LONG).show();
+        if (s.colors.length == 0 && Template.loadAll(this).isEmpty()) {
+            Toast.makeText(this, "画面の「＋色」「＋画像」で対象を追加してください", Toast.LENGTH_LONG).show();
         }
 
         MediaProjectionManager mpm = getSystemService(MediaProjectionManager.class);

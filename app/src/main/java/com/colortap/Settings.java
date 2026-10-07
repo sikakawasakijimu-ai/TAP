@@ -12,7 +12,8 @@ final class Settings {
     int tolerance = 30;        // max per-channel difference (0-255)
     int intervalMs = 300;      // time between scans
     int minHits = 3;           // matching sample points needed to count as a hit
-    boolean tapEachColor;      // true: tap every color's best spot each cycle; false: only the largest
+    boolean tapEachColor;      // true: tap every target each cycle; false: only one spot
+    int matchPct = 85;         // % of an image's sample points that must match
 
     private static final String PREFS = "settings";
 
@@ -25,6 +26,7 @@ final class Settings {
         s.intervalMs = p.getInt("intervalMs", s.intervalMs);
         s.minHits = p.getInt("minHits", s.minHits);
         s.tapEachColor = p.getBoolean("tapEachColor", s.tapEachColor);
+        s.matchPct = p.getInt("matchPct", s.matchPct);
         return s;
     }
 
@@ -35,6 +37,7 @@ final class Settings {
                 .putInt("intervalMs", intervalMs)
                 .putInt("minHits", minHits)
                 .putBoolean("tapEachColor", tapEachColor)
+                .putInt("matchPct", matchPct)
                 .apply();
     }
 

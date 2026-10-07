@@ -45,7 +45,37 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="8dp"
-            android:text="色ごとにタップする (OFF: 一番大きく見つかった1か所だけタップ)" />
+            android:text="見つけた対象をすべてタップする (OFF: 1か所だけ。画像が優先、次に一番大きい色)" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="登録画像 (動作中に画面の「＋画像」で追加。タップで削除)" />
+
+        <HorizontalScrollView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content">
+
+            <LinearLayout
+                android:id="@+id/templates"
+                android:layout_width="wrap_content"
+                android:layout_height="64dp"
+                android:gravity="center_vertical"
+                android:orientation="horizontal" />
+        </HorizontalScrollView>
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="画像の一致率 (%) (小さいほどゆるく判定)" />
+
+        <EditText
+            android:id="@+id/matchPct"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:inputType="number" />
 
         <TextView
             android:id="@+id/toleranceLabel"
@@ -100,6 +130,6 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="16dp"
-            android:text="開始すると画面の録画許可を求められます。「画面全体」を選んでください。\n色が空のまま開始して、画面の「＋色」で色を選んでもOKです。\n動作中は画面上の「■ 停止」ボタン、または通知から止められます。" />
+            android:text="開始すると画面の録画許可を求められます。「画面全体」を選んでください。\n色が空のまま開始して、画面の「＋色」「＋画像」で対象を選んでもOKです。\n動作中は画面上の「■ 停止」ボタン、または通知から止められます。" />
     </LinearLayout>
 </ScrollView>

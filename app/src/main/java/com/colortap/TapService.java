@@ -3,7 +3,9 @@ package com.colortap;
 import android.accessibilityservice.AccessibilityService;
 import android.accessibilityservice.GestureDescription;
 import android.content.Intent;
+import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.Paint;
 import android.graphics.Path;
 import android.graphics.PixelFormat;
 import android.graphics.drawable.GradientDrawable;
@@ -21,7 +23,7 @@ import android.widget.Toast;
 
 /**
  * Accessibility service that performs taps and shows the floating control panel
- * ("＋色" to pick a color from the screen, "■ 停止" to stop).
+ * ("＋色" / "＋画像" to pick a target from the screen, "■ 停止" to stop).
  * Accessibility overlays need no "draw over other apps" permission.
  */
 public class TapService extends AccessibilityService {
@@ -90,12 +92,15 @@ public class TapService extends AccessibilityService {
             p.setBackground(bg);
 
             TextView add = button("＋色", d);
+            TextView addImage = button("＋画像", d);
             TextView stop = button("■ 停止", d);
-            add.setOnTouchListener(new DragListener((int) (8 * d), this::startPick));
+            add.setOnTouchListener(new DragListener((int) (8 * d), () -> startPick(false)));
+            addImage.setOnTouchListener(new DragListener((int) (8 * d), () -> startPick(true)));
             stop.setOnTouchListener(new DragListener((int) (8 * d), () ->
                     startService(new Intent(this, CaptureService.class)
                             .setAction(CaptureService.ACTION_STOP))));
             p.addView(add);
+            p.addView(addImage);
             p.addView(stop);
 
             panelLp = new WindowManager.LayoutParams(
@@ -145,16 +150,20 @@ public class TapService extends AccessibilityService {
         btnBottom = loc[1] + panel.getHeight();
     }
 
-    /** Shows a transparent full-screen layer; the next tap on it picks the color under the finger. */
-    private void startPick() {
+    /**
+     * Shows a transparent full-screen layer. For a color, the next tap picks the color under
+     * the finger; for an image, a drag selects the region to register.
+     */
+    private void startPick(boolean image) {
         CaptureService cs = CaptureService.instance;
         if (pickOverlay != null || cs == null) return;
         cs.setPicking(true);
         float d = getResources().getDisplayMetrics().density;
 
-        FrameLayout layer = new FrameLayout(this);
+        SelectionLayer layer = new SelectionLayer(d);
         TextView banner = new TextView(this);
-        banner.setText("色を取りたい場所をタップ\n(この帯をタップでキャンセル)");
+        banner.setText((image ? "登録したい部分を指でなぞって囲む" : "色を取りたい場所をタップ")
+                + "\n(この帯をタップでキャンセル)");
         banner.setTextColor(Color.WHITE);
         banner.setBackgroundColor(0xCC000000);
         banner.setGravity(Gravity.CENTER);
@@ -168,11 +177,36 @@ public class TapService extends AccessibilityService {
         layer.addView(banner, blp);
 
         layer.setOnTouchListener((v, e) -> {
-            if (e.getActionMasked() == MotionEvent.ACTION_UP) {
-                float x = e.getRawX(), y = e.getRawY();
-                removePickOverlay();
-                CaptureService c = CaptureService.instance;
-                if (c != null) c.pickAt(x, y);
+            float x = e.getRawX(), y = e.getRawY();
+            switch (e.getActionMasked()) {
+                case MotionEvent.ACTION_DOWN:
+                    layer.x0 = layer.x1 = x;
+                    layer.y0 = layer.y1 = y;
+                    break;
+                case MotionEvent.ACTION_MOVE:
+                    if (image) {
+                        layer.x1 = x;
+                        layer.y1 = y;
+                        layer.invalidate();
+                    }
+                    break;
+                case MotionEvent.ACTION_UP:
+                    CaptureService c = CaptureService.instance;
+                    if (!image) {
+                        removePickOverlay();
+                        if (c != null) c.pickAt(x, y);
+                    } else if (Math.abs(x - layer.x0) < 16 * d || Math.abs(y - layer.y0) < 16 * d) {
+                        Toast.makeText(this, "もう少し大きく囲んでください", Toast.LENGTH_SHORT).show();
+                        layer.x1 = layer.x0;
+                        layer.invalidate();
+                    } else {
+                        removePickOverlay();
+                        if (c != null) {
+                            c.pickImage(Math.min(x, layer.x0), Math.min(y, layer.y0),
+                                    Math.max(x, layer.x0), Math.max(y, layer.y0));
+                        }
+                    }
+                    break;
             }
             return true;
         });
@@ -187,6 +221,29 @@ public class TapService extends AccessibilityService {
                 PixelFormat.TRANSLUCENT);
         wm.addView(layer, lp);
         pickOverlay = layer;
+    }
+
+    /** Full-screen layer that draws the drag rectangle (raw screen coordinates). */
+    private class SelectionLayer extends FrameLayout {
+        float x0, y0, x1, y1;
+        private final Paint paint = new Paint();
+
+        SelectionLayer(float d) {
+            super(TapService.this);
+            setWillNotDraw(false);
+            paint.setStyle(Paint.Style.STROKE);
+            paint.setStrokeWidth(2 * d);
+            paint.setColor(0xFF00E5FF);
+        }
+
+        @Override
+        protected void onDraw(Canvas canvas) {
+            if (x0 == x1 || y0 == y1) return;
+            int[] loc = new int[2];
+            getLocationOnScreen(loc);
+            canvas.drawRect(Math.min(x0, x1) - loc[0], Math.min(y0, y1) - loc[1],
+                    Math.max(x0, x1) - loc[0], Math.max(y0, y1) - loc[1], paint);
+        }
     }
 
     private void cancelPick() {
@@ -209,6 +266,12 @@ public class TapService extends AccessibilityService {
                     : String.format(added ? "#%06X を追加しました" : "#%06X は登録済みです", color);
             Toast.makeText(this, msg, Toast.LENGTH_SHORT).show();
         });
+    }
+
+    void onImagePicked(boolean ok) {
+        main.post(() -> Toast.makeText(this,
+                ok ? "画像を登録しました" : "画像を登録できませんでした。もう一度試してください",
+                Toast.LENGTH_SHORT).show());
     }
 
     /** Drags the panel; a touch that does not move far enough counts as a click. */
