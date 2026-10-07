@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">ColorTap</string>
+    <string name="a11y_description">指定した色を画面上で見つけてタップします。画面のタップ操作にのみ使用します。</string>
+</resources>
