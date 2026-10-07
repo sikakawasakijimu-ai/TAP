@@ -3,7 +3,6 @@ package com.colortap;
 import android.Manifest;
 import android.app.Activity;
 import android.content.Intent;
-import android.graphics.Color;
 import android.media.projection.MediaProjectionConfig;
 import android.media.projection.MediaProjectionManager;
 import android.os.Build;
@@ -12,7 +11,9 @@ import android.provider.Settings;
 import android.text.Editable;
 import android.text.TextWatcher;
 import android.view.View;
+import android.widget.CheckBox;
 import android.widget.EditText;
+import android.widget.LinearLayout;
 import android.widget.SeekBar;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -24,7 +25,8 @@ public class MainActivity extends Activity {
     private TextView status, toleranceLabel;
     private EditText color, interval, minHits;
     private SeekBar tolerance;
-    private View preview;
+    private LinearLayout preview;
+    private CheckBox tapEachColor;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -38,14 +40,7 @@ public class MainActivity extends Activity {
         minHits = findViewById(R.id.minHits);
         tolerance = findViewById(R.id.tolerance);
         preview = findViewById(R.id.preview);
-
-        com.colortap.Settings s = com.colortap.Settings.load(this);
-        color.setText(String.format("#%06X", s.color));
-        tolerance.setProgress(s.tolerance);
-        interval.setText(String.valueOf(s.intervalMs));
-        minHits.setText(String.valueOf(s.minHits));
-        updateToleranceLabel();
-        updatePreview();
+        tapEachColor = findViewById(R.id.tapEachColor);
 
         color.addTextChangedListener(new TextWatcher() {
             public void beforeTextChanged(CharSequence c, int a, int b, int d) {}
@@ -75,7 +70,40 @@ public class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        // Reload: colors may have been added from the screen while we were away.
+        com.colortap.Settings s = com.colortap.Settings.load(this);
+        color.setText(com.colortap.Settings.formatColors(s.colors));
+        tapEachColor.setChecked(s.tapEachColor);
+        tolerance.setProgress(s.tolerance);
+        interval.setText(String.valueOf(s.intervalMs));
+        minHits.setText(String.valueOf(s.minHits));
+        updateToleranceLabel();
+        updatePreview();
         updateStatus();
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        // Save edits and apply them to a running session right away.
+        if (saveSettings() != null) {
+            CaptureService cs = CaptureService.instance;
+            if (cs != null) cs.reloadSettings();
+        }
+    }
+
+    /** Saves the form; returns null (and saves nothing) if the color list is invalid. */
+    private com.colortap.Settings saveSettings() {
+        int[] c = parseColors();
+        if (c == null) return null;
+        com.colortap.Settings s = new com.colortap.Settings();
+        s.colors = c;
+        s.tapEachColor = tapEachColor.isChecked();
+        s.tolerance = tolerance.getProgress();
+        s.intervalMs = parseInt(interval, 300, 50, 60_000);
+        s.minHits = parseInt(minHits, 3, 1, 100);
+        s.save(this);
+        return s;
     }
 
     private void updateStatus() {
@@ -90,19 +118,21 @@ public class MainActivity extends Activity {
     }
 
     private void updatePreview() {
-        Integer c = parseColor();
-        preview.setBackgroundColor(c == null ? Color.TRANSPARENT : 0xFF000000 | c);
+        preview.removeAllViews();
+        int[] colors = parseColors();
+        if (colors == null) return;
+        int size = (int) (32 * getResources().getDisplayMetrics().density);
+        for (int c : colors) {
+            View v = new View(this);
+            v.setBackgroundColor(0xFF000000 | c);
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(size, size);
+            lp.setMarginEnd(size / 4);
+            preview.addView(v, lp);
+        }
     }
 
-    private Integer parseColor() {
-        String t = color.getText().toString().trim();
-        if (t.startsWith("#")) t = t.substring(1);
-        if (t.length() != 6) return null;
-        try {
-            return Integer.parseInt(t, 16);
-        } catch (NumberFormatException e) {
-            return null;
-        }
+    private int[] parseColors() {
+        return com.colortap.Settings.parseColors(color.getText().toString().trim());
     }
 
     private static int parseInt(EditText e, int def, int min, int max) {
@@ -114,9 +144,9 @@ public class MainActivity extends Activity {
     }
 
     private void start() {
-        Integer c = parseColor();
-        if (c == null) {
-            Toast.makeText(this, "色は #RRGGBB の形式で入力してください", Toast.LENGTH_LONG).show();
+        com.colortap.Settings s = saveSettings();
+        if (s == null) {
+            Toast.makeText(this, "色は #RRGGBB の形式で入力してください (複数はカンマ区切り)", Toast.LENGTH_LONG).show();
             return;
         }
         if (TapService.instance == null) {
@@ -127,12 +157,9 @@ public class MainActivity extends Activity {
             Toast.makeText(this, "すでに動作中です", Toast.LENGTH_SHORT).show();
             return;
         }
-        com.colortap.Settings s = new com.colortap.Settings();
-        s.color = c;
-        s.tolerance = tolerance.getProgress();
-        s.intervalMs = parseInt(interval, 300, 50, 60_000);
-        s.minHits = parseInt(minHits, 3, 1, 100);
-        s.save(this);
+        if (s.colors.length == 0) {
+            Toast.makeText(this, "画面の「＋色」で色を追加してください", Toast.LENGTH_LONG).show();
+        }
 
         MediaProjectionManager mpm = getSystemService(MediaProjectionManager.class);
         Intent i = Build.VERSION.SDK_INT >= 34

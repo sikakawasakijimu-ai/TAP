@@ -25,28 +25,27 @@
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:layout_marginTop="16dp"
-            android:text="タップする色 (例: #FF0000)" />
+            android:text="タップする色 (複数可。カンマか改行で区切る)\n動作中に画面の「＋色」→ 画面をタップでも追加できます" />
 
-        <LinearLayout
+        <EditText
+            android:id="@+id/color"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:gravity="center_vertical"
-            android:orientation="horizontal">
+            android:hint="#FF0000, #00FF00"
+            android:inputType="textNoSuggestions|textCapCharacters|textMultiLine" />
 
-            <EditText
-                android:id="@+id/color"
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:inputType="textNoSuggestions|textCapCharacters"
-                android:maxLength="7" />
+        <LinearLayout
+            android:id="@+id/preview"
+            android:layout_width="match_parent"
+            android:layout_height="32dp"
+            android:orientation="horizontal" />
 
-            <View
-                android:id="@+id/preview"
-                android:layout_width="48dp"
-                android:layout_height="48dp"
-                android:layout_marginStart="8dp" />
-        </LinearLayout>
+        <CheckBox
+            android:id="@+id/tapEachColor"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="色ごとにタップする (OFF: 一番大きく見つかった1か所だけタップ)" />
 
         <TextView
             android:id="@+id/toleranceLabel"
@@ -101,6 +100,6 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="16dp"
-            android:text="開始すると画面の録画許可を求められます。「画面全体」を選んでください。\n動作中は画面上の「■ 停止」ボタン、または通知から止められます。" />
+            android:text="開始すると画面の録画許可を求められます。「画面全体」を選んでください。\n色が空のまま開始して、画面の「＋色」で色を選んでもOKです。\n動作中は画面上の「■ 停止」ボタン、または通知から止められます。" />
     </LinearLayout>
 </ScrollView>

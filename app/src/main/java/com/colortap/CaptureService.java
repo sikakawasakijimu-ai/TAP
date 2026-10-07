@@ -35,6 +35,7 @@ public class CaptureService extends Service {
     static final String EXTRA_DATA = "data";
 
     static volatile boolean running;
+    static volatile CaptureService instance;
 
     /** Capture is 1/SCALE of the screen size in each direction: 1/9 the pixels to scan. */
     private static final int SCALE = 3;
@@ -55,10 +56,18 @@ public class CaptureService extends Service {
     private float toScreenX, toScreenY;
     private Settings settings;
 
+    private int cells;
+    // Per color: [color * cells + cell]
     private int[] cellCount, cellSumX, cellSumY;
     private byte[] row;
-    // Last hit in screen coordinates; reused when the screen has not changed since the last scan.
-    private float lastX = -1, lastY = -1;
+    // Last hits in screen coordinates (x0, y0, x1, y1, ...); reused while the screen is unchanged.
+    private float[] hits;
+    private int hitCount;
+
+    // Color picking: while true, frames are copied into `frame` instead of scanned, and no taps happen.
+    private volatile boolean picking;
+    private byte[] frame;
+    private boolean frameValid;
 
     @Override
     public IBinder onBind(Intent intent) {
@@ -104,9 +113,8 @@ public class CaptureService extends Service {
         toScreenY = dm.heightPixels / (float) capH;
 
         int cols = (capW + CELL - 1) / CELL, rows = (capH + CELL - 1) / CELL;
-        cellCount = new int[cols * rows];
-        cellSumX = new int[cols * rows];
-        cellSumY = new int[cols * rows];
+        cells = cols * rows;
+        allocate();
 
         reader = ImageReader.newInstance(capW, capH, PixelFormat.RGBA_8888, 2);
         display = projection.createVirtualDisplay("ColorTap", capW, capH,
@@ -114,8 +122,9 @@ public class CaptureService extends Service {
                 DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
                 reader.getSurface(), null, handler);
 
+        instance = this;
         TapService svc = TapService.instance;
-        if (svc != null) svc.showStopButton();
+        if (svc != null) svc.showPanel();
 
         handler.postDelayed(scan, settings.intervalMs);
         return START_NOT_STICKY;
@@ -133,18 +142,100 @@ public class CaptureService extends Service {
             }
             if (img != null) {
                 try {
-                    findTarget(img);
+                    if (picking) copyFrame(img);
+                    else findTarget(img);
                 } finally {
                     img.close();
                 }
             }
             TapService svc = TapService.instance;
-            if (svc != null && lastX >= 0) svc.tap(lastX, lastY);
-            handler.postDelayed(this, settings.intervalMs);
+            int delay = settings.intervalMs;
+            if (svc != null && hitCount > 0 && !picking) {
+                svc.tap(hits, hitCount);
+                // Let the whole tap sequence finish before the next one replaces it.
+                delay = Math.max(delay, hitCount * 80 + 40);
+            }
+            handler.postDelayed(this, delay);
         }
     };
 
-    /** Sets lastX/lastY to the centre of the densest patch of matching color, or -1 if none. */
+    private void allocate() {
+        int k = settings.colors.length;
+        cellCount = new int[k * cells];
+        cellSumX = new int[k * cells];
+        cellSumY = new int[k * cells];
+        hits = new float[k * 2];
+        hitCount = 0;
+    }
+
+    /** Re-reads settings saved by the app, so edits apply without restarting. */
+    void reloadSettings() {
+        handler.post(() -> {
+            settings = Settings.load(this);
+            allocate();
+        });
+    }
+
+    void setPicking(boolean on) {
+        handler.post(() -> {
+            picking = on;
+            frameValid = false;
+            hitCount = 0;
+        });
+    }
+
+    /** Adds the color at screen point (x, y) to the target list, then resumes tapping. */
+    void pickAt(float x, float y) {
+        handler.post(() -> {
+            // Grab the newest frame (the pick layer is gone by now or nearly so).
+            Image img = reader.acquireLatestImage();
+            if (img != null) {
+                try {
+                    copyFrame(img);
+                } finally {
+                    img.close();
+                }
+            }
+            int color = -1;
+            boolean added = false;
+            if (frameValid) {
+                int cx = Math.max(0, Math.min(capW - 1, (int) (x / toScreenX)));
+                int cy = Math.max(0, Math.min(capH - 1, (int) (y / toScreenY)));
+                int i = (cy * capW + cx) * 4;
+                color = ((frame[i] & 0xFF) << 16) | ((frame[i + 1] & 0xFF) << 8) | (frame[i + 2] & 0xFF);
+                added = true;
+                for (int c : settings.colors) if (c == color) added = false;
+                if (added) {
+                    int[] colors = java.util.Arrays.copyOf(settings.colors, settings.colors.length + 1);
+                    colors[colors.length - 1] = color;
+                    settings.colors = colors;
+                    settings.save(this);
+                    allocate();
+                }
+            }
+            picking = false;
+            frameValid = false;
+            TapService svc = TapService.instance;
+            if (svc != null) svc.onPicked(color, added);
+        });
+    }
+
+    /** Copies the image into `frame` as tightly packed RGBA. */
+    private void copyFrame(Image img) {
+        Image.Plane plane = img.getPlanes()[0];
+        ByteBuffer buf = plane.getBuffer();
+        int rowStride = plane.getRowStride();
+        int rowBytes = capW * 4;
+        if (frame == null) frame = new byte[capW * capH * 4];
+        int h = Math.min(img.getHeight(), capH);
+        for (int y = 0; y < h; y++) {
+            buf.position(y * rowStride);
+            buf.get(frame, y * rowBytes, Math.min(rowBytes, buf.remaining()));
+        }
+        frameValid = true;
+    }
+
+    /** Fills hits/hitCount with the centres of the densest patches of the target colors. */
     private void findTarget(Image img) {
         Image.Plane plane = img.getPlanes()[0];
         ByteBuffer buf = plane.getBuffer();
@@ -153,9 +244,14 @@ public class CaptureService extends Service {
         int w = Math.min(img.getWidth(), capW), h = Math.min(img.getHeight(), capH);
         if (row == null || row.length < rowStride) row = new byte[rowStride];
 
-        int tr = (settings.color >> 16) & 0xFF;
-        int tg = (settings.color >> 8) & 0xFF;
-        int tb = settings.color & 0xFF;
+        int[] colors = settings.colors;
+        int k = colors.length;
+        int[] tr = new int[k], tg = new int[k], tb = new int[k];
+        for (int j = 0; j < k; j++) {
+            tr[j] = (colors[j] >> 16) & 0xFF;
+            tg[j] = (colors[j] >> 8) & 0xFF;
+            tb[j] = colors[j] & 0xFF;
+        }
         int tol = settings.tolerance;
         int cols = (capW + CELL - 1) / CELL;
 
@@ -180,30 +276,42 @@ public class CaptureService extends Service {
             int cellRow = (y / CELL) * cols;
             for (int x = 0; x < w; x += STEP) {
                 int i = x * pixStride;
-                if (Math.abs((row[i] & 0xFF) - tr) > tol) continue;
-                if (Math.abs((row[i + 1] & 0xFF) - tg) > tol) continue;
-                if (Math.abs((row[i + 2] & 0xFF) - tb) > tol) continue;
-                if (rowExcluded && x >= exL && x < exR) continue;
-                int c = cellRow + x / CELL;
-                cellCount[c]++;
-                cellSumX[c] += x;
-                cellSumY[c] += y;
+                int r = row[i] & 0xFF, g = row[i + 1] & 0xFF, b = row[i + 2] & 0xFF;
+                for (int j = 0; j < k; j++) {
+                    if (Math.abs(r - tr[j]) > tol || Math.abs(g - tg[j]) > tol
+                            || Math.abs(b - tb[j]) > tol) continue;
+                    if (rowExcluded && x >= exL && x < exR) break;
+                    int c = j * cells + cellRow + x / CELL;
+                    cellCount[c]++;
+                    cellSumX[c] += x;
+                    cellSumY[c] += y;
+                    break; // first matching color wins
+                }
             }
         }
 
-        int best = -1, bestCount = Math.max(1, settings.minHits) - 1;
-        for (int c = 0; c < cellCount.length; c++) {
+        int threshold = Math.max(1, settings.minHits) - 1;
+        hitCount = 0;
+        if (settings.tapEachColor) {
+            for (int j = 0; j < k; j++) addBest(j * cells, (j + 1) * cells, threshold);
+        } else {
+            addBest(0, k * cells, threshold);
+        }
+    }
+
+    /** Adds the centre of the densest cell in [from, to) to hits, if it beats threshold. */
+    private void addBest(int from, int to, int threshold) {
+        int best = -1, bestCount = threshold;
+        for (int c = from; c < to; c++) {
             if (cellCount[c] > bestCount) {
                 bestCount = cellCount[c];
                 best = c;
             }
         }
-        if (best < 0) {
-            lastX = lastY = -1;
-        } else {
-            lastX = (cellSumX[best] / (float) bestCount + 0.5f) * toScreenX;
-            lastY = (cellSumY[best] / (float) bestCount + 0.5f) * toScreenY;
-        }
+        if (best < 0) return;
+        hits[hitCount * 2] = (cellSumX[best] / (float) bestCount + 0.5f) * toScreenX;
+        hits[hitCount * 2 + 1] = (cellSumY[best] / (float) bestCount + 0.5f) * toScreenY;
+        hitCount++;
     }
 
     private void startForegroundCompat() {
@@ -237,6 +345,7 @@ public class CaptureService extends Service {
     public void onDestroy() {
         boolean wasRunning = running;
         running = false;
+        instance = null;
         if (handler != null) {
             // Release on the scan thread so an in-progress scan never sees a closed reader.
             handler.removeCallbacksAndMessages(null);
@@ -253,7 +362,7 @@ public class CaptureService extends Service {
             projection.stop();
         }
         TapService svc = TapService.instance;
-        if (wasRunning && svc != null) svc.hideStopButton();
+        if (wasRunning && svc != null) svc.hidePanel();
         super.onDestroy();
     }
 }

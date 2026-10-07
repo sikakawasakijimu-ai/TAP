@@ -14,11 +14,15 @@ import android.view.MotionEvent;
 import android.view.View;
 import android.view.WindowManager;
 import android.view.accessibility.AccessibilityEvent;
+import android.widget.FrameLayout;
+import android.widget.LinearLayout;
 import android.widget.TextView;
+import android.widget.Toast;
 
 /**
- * Accessibility service that performs taps and shows the floating stop button.
- * An accessibility overlay needs no "draw over other apps" permission.
+ * Accessibility service that performs taps and shows the floating control panel
+ * ("＋色" to pick a color from the screen, "■ 停止" to stop).
+ * Accessibility overlays need no "draw over other apps" permission.
  */
 public class TapService extends AccessibilityService {
 
@@ -26,10 +30,11 @@ public class TapService extends AccessibilityService {
 
     private final Handler main = new Handler(Looper.getMainLooper());
     private WindowManager wm;
-    private TextView stopButton;
-    private WindowManager.LayoutParams lp;
+    private LinearLayout panel;
+    private WindowManager.LayoutParams panelLp;
+    private View pickOverlay;
 
-    // Stop button bounds in screen pixels, read by the scan thread to skip that area.
+    // Panel bounds in screen pixels, read by the scan thread to skip that area.
     volatile int btnLeft, btnTop, btnRight, btnBottom;
 
     @Override
@@ -49,84 +54,174 @@ public class TapService extends AccessibilityService {
     @Override
     public boolean onUnbind(Intent intent) {
         instance = null;
-        hideStopButton();
+        hidePanel();
         stopService(new Intent(this, CaptureService.class));
         return super.onUnbind(intent);
     }
 
-    void tap(float x, float y) {
+    /**
+     * Taps the first n points of xy (x0, y0, x1, y1, ...) one after another.
+     * They go in one gesture because a new dispatchGesture cancels one in progress.
+     */
+    void tap(float[] xy, int n) {
+        float[] pts = java.util.Arrays.copyOf(xy, n * 2);
         main.post(() -> {
-            Path path = new Path();
-            path.moveTo(x, y);
-            GestureDescription g = new GestureDescription.Builder()
-                    .addStroke(new GestureDescription.StrokeDescription(path, 0, 40))
-                    .build();
-            dispatchGesture(g, null, null);
+            GestureDescription.Builder b = new GestureDescription.Builder();
+            int max = Math.min(n, GestureDescription.getMaxStrokeCount());
+            for (int i = 0; i < max; i++) {
+                Path path = new Path();
+                path.moveTo(pts[i * 2], pts[i * 2 + 1]);
+                b.addStroke(new GestureDescription.StrokeDescription(path, i * 80L, 40));
+            }
+            dispatchGesture(b.build(), null, null);
         });
     }
 
-    void showStopButton() {
+    void showPanel() {
         main.post(() -> {
-            if (stopButton != null) return;
+            if (panel != null) return;
             float d = getResources().getDisplayMetrics().density;
 
-            TextView b = new TextView(this);
-            b.setText("■ 停止");
-            b.setTextColor(Color.WHITE);
-            b.setTextSize(14);
-            int pad = (int) (10 * d);
-            b.setPadding(pad, pad, pad, pad);
+            LinearLayout p = new LinearLayout(this);
+            p.setOrientation(LinearLayout.HORIZONTAL);
             GradientDrawable bg = new GradientDrawable();
             bg.setColor(0xCC333333);
             bg.setCornerRadius(8 * d);
-            b.setBackground(bg);
+            p.setBackground(bg);
 
-            lp = new WindowManager.LayoutParams(
+            TextView add = button("＋色", d);
+            TextView stop = button("■ 停止", d);
+            add.setOnTouchListener(new DragListener((int) (8 * d), this::startPick));
+            stop.setOnTouchListener(new DragListener((int) (8 * d), () ->
+                    startService(new Intent(this, CaptureService.class)
+                            .setAction(CaptureService.ACTION_STOP))));
+            p.addView(add);
+            p.addView(stop);
+
+            panelLp = new WindowManager.LayoutParams(
                     WindowManager.LayoutParams.WRAP_CONTENT,
                     WindowManager.LayoutParams.WRAP_CONTENT,
                     WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
                     WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
                             | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
                     PixelFormat.TRANSLUCENT);
-            lp.gravity = Gravity.TOP | Gravity.START;
-            lp.x = (int) (8 * d);
-            lp.y = (int) (120 * d);
+            panelLp.gravity = Gravity.TOP | Gravity.START;
+            panelLp.x = (int) (8 * d);
+            panelLp.y = (int) (120 * d);
 
-            b.setOnTouchListener(new DragListener((int) (8 * d)));
-            b.addOnLayoutChangeListener((v, l, t, r, bt, ol, ot, or, ob) -> updateBounds());
-            wm.addView(b, lp);
-            stopButton = b;
+            p.addOnLayoutChangeListener((v, l, t, r, bt, ol, ot, or, ob) -> updateBounds());
+            wm.addView(p, panelLp);
+            panel = p;
         });
     }
 
-    void hideStopButton() {
+    private TextView button(String text, float d) {
+        TextView b = new TextView(this);
+        b.setText(text);
+        b.setTextColor(Color.WHITE);
+        b.setTextSize(14);
+        int pad = (int) (10 * d);
+        b.setPadding(pad, pad, pad, pad);
+        return b;
+    }
+
+    void hidePanel() {
         main.post(() -> {
-            if (stopButton == null) return;
-            wm.removeView(stopButton);
-            stopButton = null;
+            cancelPick();
+            if (panel == null) return;
+            wm.removeView(panel);
+            panel = null;
             btnLeft = btnTop = btnRight = btnBottom = 0;
         });
     }
 
     private void updateBounds() {
-        if (stopButton == null) return;
+        if (panel == null) return;
         int[] loc = new int[2];
-        stopButton.getLocationOnScreen(loc);
+        panel.getLocationOnScreen(loc);
         btnLeft = loc[0];
         btnTop = loc[1];
-        btnRight = loc[0] + stopButton.getWidth();
-        btnBottom = loc[1] + stopButton.getHeight();
+        btnRight = loc[0] + panel.getWidth();
+        btnBottom = loc[1] + panel.getHeight();
     }
 
-    /** Drags the button; a touch that does not move far enough counts as a click (stop). */
+    /** Shows a transparent full-screen layer; the next tap on it picks the color under the finger. */
+    private void startPick() {
+        CaptureService cs = CaptureService.instance;
+        if (pickOverlay != null || cs == null) return;
+        cs.setPicking(true);
+        float d = getResources().getDisplayMetrics().density;
+
+        FrameLayout layer = new FrameLayout(this);
+        TextView banner = new TextView(this);
+        banner.setText("色を取りたい場所をタップ\n(この帯をタップでキャンセル)");
+        banner.setTextColor(Color.WHITE);
+        banner.setBackgroundColor(0xCC000000);
+        banner.setGravity(Gravity.CENTER);
+        int pad = (int) (12 * d);
+        banner.setPadding(pad, pad, pad, pad);
+        FrameLayout.LayoutParams blp = new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.BOTTOM);
+        blp.bottomMargin = (int) (64 * d);
+        banner.setOnClickListener(v -> cancelPick());
+        layer.addView(banner, blp);
+
+        layer.setOnTouchListener((v, e) -> {
+            if (e.getActionMasked() == MotionEvent.ACTION_UP) {
+                float x = e.getRawX(), y = e.getRawY();
+                removePickOverlay();
+                CaptureService c = CaptureService.instance;
+                if (c != null) c.pickAt(x, y);
+            }
+            return true;
+        });
+
+        WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                PixelFormat.TRANSLUCENT);
+        wm.addView(layer, lp);
+        pickOverlay = layer;
+    }
+
+    private void cancelPick() {
+        if (pickOverlay == null) return;
+        removePickOverlay();
+        CaptureService cs = CaptureService.instance;
+        if (cs != null) cs.setPicking(false);
+    }
+
+    private void removePickOverlay() {
+        if (pickOverlay == null) return;
+        wm.removeView(pickOverlay);
+        pickOverlay = null;
+    }
+
+    /** Called by CaptureService after a pick; color is RGB, or -1 if it could not be read. */
+    void onPicked(int color, boolean added) {
+        main.post(() -> {
+            String msg = color < 0 ? "色を取得できませんでした。もう一度試してください"
+                    : String.format(added ? "#%06X を追加しました" : "#%06X は登録済みです", color);
+            Toast.makeText(this, msg, Toast.LENGTH_SHORT).show();
+        });
+    }
+
+    /** Drags the panel; a touch that does not move far enough counts as a click. */
     private class DragListener implements View.OnTouchListener {
         private final int slop;
+        private final Runnable onClick;
         private float downX, downY;
         private int startX, startY;
         private boolean dragging;
 
-        DragListener(int slop) {
+        DragListener(int slop, Runnable onClick) {
             this.slop = slop;
+            this.onClick = onClick;
         }
 
         @Override
@@ -135,25 +230,22 @@ public class TapService extends AccessibilityService {
                 case MotionEvent.ACTION_DOWN:
                     downX = e.getRawX();
                     downY = e.getRawY();
-                    startX = lp.x;
-                    startY = lp.y;
+                    startX = panelLp.x;
+                    startY = panelLp.y;
                     dragging = false;
                     return true;
                 case MotionEvent.ACTION_MOVE:
                     float dx = e.getRawX() - downX, dy = e.getRawY() - downY;
                     if (!dragging && Math.hypot(dx, dy) > slop) dragging = true;
-                    if (dragging) {
-                        lp.x = startX + (int) dx;
-                        lp.y = startY + (int) dy;
-                        wm.updateViewLayout(v, lp);
-                        v.post(TapService.this::updateBounds);
+                    if (dragging && panel != null) {
+                        panelLp.x = startX + (int) dx;
+                        panelLp.y = startY + (int) dy;
+                        wm.updateViewLayout(panel, panelLp);
+                        panel.post(TapService.this::updateBounds);
                     }
                     return true;
                 case MotionEvent.ACTION_UP:
-                    if (!dragging) {
-                        startService(new Intent(TapService.this, CaptureService.class)
-                                .setAction(CaptureService.ACTION_STOP));
-                    }
+                    if (!dragging) onClick.run();
                     return true;
             }
             return false;
