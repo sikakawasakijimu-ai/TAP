@@ -10,9 +10,6 @@ import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.List;
 import java.util.Random;
 
 /**
@@ -76,8 +73,11 @@ final class Template {
         return d;
     }
 
-    /** Crops a w x h region at (x, y) out of a tightly packed RGBA frame of width frameW and saves it. */
-    static void save(Context c, byte[] frame, int frameW, int x, int y, int w, int h) throws IOException {
+    /**
+     * Crops a w x h region at (x, y) out of a tightly packed RGBA frame of width frameW,
+     * saves it and returns the file name.
+     */
+    static String save(Context c, byte[] frame, int frameW, int x, int y, int w, int h) throws IOException {
         byte[] out = new byte[w * h * 4];
         for (int row = 0; row < h; row++) {
             System.arraycopy(frame, ((y + row) * frameW + x) * 4, out, row * w * 4, w * 4);
@@ -88,23 +88,19 @@ final class Template {
             o.writeInt(h);
             o.write(out);
         }
+        return f.getName();
     }
 
-    static List<Template> loadAll(Context c) {
-        File[] files = dir(c).listFiles((d, name) -> name.endsWith(".bin"));
-        List<Template> out = new ArrayList<>();
-        if (files == null) return out;
-        Arrays.sort(files);
-        for (File f : files) {
-            try (DataInputStream in = new DataInputStream(new FileInputStream(f))) {
-                int w = in.readInt(), h = in.readInt();
-                byte[] rgba = new byte[w * h * 4];
-                in.readFully(rgba);
-                out.add(new Template(f, w, h, rgba));
-            } catch (IOException | RuntimeException e) {
-                f.delete(); // corrupt file
-            }
+    /** Loads a saved image by file name; returns null if it is missing or unreadable. */
+    static Template load(Context c, String name) {
+        File f = new File(dir(c), name);
+        try (DataInputStream in = new DataInputStream(new FileInputStream(f))) {
+            int w = in.readInt(), h = in.readInt();
+            byte[] rgba = new byte[w * h * 4];
+            in.readFully(rgba);
+            return new Template(f, w, h, rgba);
+        } catch (IOException | RuntimeException e) {
+            return null;
         }
-        return out;
     }
 }

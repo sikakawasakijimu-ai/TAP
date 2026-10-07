@@ -22,11 +22,15 @@ import android.os.Process;
 import android.util.DisplayMetrics;
 import android.view.WindowManager;
 
+import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
 
 /**
- * Captures the screen at reduced resolution and taps the largest patch of the target color.
- * Runs until stopped from the overlay button, the notification, or the app.
+ * Captures the screen at reduced resolution and taps the registered targets (colors and images)
+ * in priority order. Runs until stopped from the overlay panel, the notification, or the app.
  */
 public class CaptureService extends Service {
 
@@ -39,9 +43,9 @@ public class CaptureService extends Service {
 
     /** Capture is 1/SCALE of the screen size in each direction: 1/9 the pixels to scan. */
     private static final int SCALE = 3;
-    /** Sample every STEP-th pixel of the captured image. */
+    /** Sample every STEP-th pixel of the captured image when looking for colors. */
     private static final int STEP = 2;
-    /** Matches are grouped into CELL x CELL blocks (captured pixels); the densest block wins. */
+    /** Color matches are grouped into CELL x CELL blocks (captured pixels); the densest block wins. */
     private static final int CELL = 12;
 
     private static final String CHANNEL = "run";
@@ -56,17 +60,24 @@ public class CaptureService extends Service {
     private float toScreenX, toScreenY;
     private Settings settings;
 
+    // Targets in priority order: KIND_COLOR -> colors[index], KIND_IMAGE -> templates.get(index).
+    private static final int KIND_COLOR = 0, KIND_IMAGE = 1;
+    private int[] kind = new int[0], index = new int[0];
+    private int[] colors = new int[0];
+    private List<Template> templates = new ArrayList<>();
+
     private int cells;
     // Per color: [color * cells + cell]
     private int[] cellCount, cellSumX, cellSumY;
+    private boolean[] colorFound;
+    private float[] colorX, colorY;
     private byte[] row;
-    // Last hits in screen coordinates (x0, y0, x1, y1, ...); reused while the screen is unchanged.
-    private float[] hits;
+    // Hits to tap, in screen coordinates (x0, y0, x1, y1, ...); reused while the screen is unchanged.
+    private float[] hits = new float[0];
     private int hitCount;
 
-    // Color picking: while true, frames are copied into `frame` instead of scanned, and no taps happen.
+    // Picking: while true, frames are copied into `frame` instead of scanned, and no taps happen.
     private volatile boolean picking;
-    private java.util.List<Template> templates = new java.util.ArrayList<>();
     private byte[] frame;
     private boolean frameValid;
 
@@ -94,7 +105,6 @@ public class CaptureService extends Service {
         }
         running = true;
         settings = Settings.load(this);
-        templates = Template.loadAll(this);
 
         thread = new HandlerThread("scan", Process.THREAD_PRIORITY_BACKGROUND);
         thread.start();
@@ -116,7 +126,7 @@ public class CaptureService extends Service {
 
         int cols = (capW + CELL - 1) / CELL, rows = (capH + CELL - 1) / CELL;
         cells = cols * rows;
-        allocate();
+        loadTargets();
 
         reader = ImageReader.newInstance(capW, capH, PixelFormat.RGBA_8888, 2);
         display = projection.createVirtualDisplay("ColorTap", capW, capH,
@@ -144,17 +154,8 @@ public class CaptureService extends Service {
             }
             if (img != null) {
                 try {
-                    if (picking) {
-                        copyFrame(img);
-                    } else {
-                        hitCount = 0;
-                        // Images take priority over colors when only one spot is tapped.
-                        if (!templates.isEmpty()) {
-                            copyFrame(img);
-                            findImages();
-                        }
-                        if (settings.tapEachColor || hitCount == 0) findTarget(img);
-                    }
+                    if (picking) copyFrame(img);
+                    else findTargets(img);
                 } finally {
                     img.close();
                 }
@@ -170,12 +171,38 @@ public class CaptureService extends Service {
         }
     };
 
-    private void allocate() {
-        int k = settings.colors.length;
-        cellCount = new int[k * cells];
-        cellSumX = new int[k * cells];
-        cellSumY = new int[k * cells];
-        hits = new float[(k + templates.size()) * 2];
+    /** Builds the per-kind lookup tables from settings.targets. */
+    private void loadTargets() {
+        int n = settings.targets.size();
+        int[] k = new int[n], idx = new int[n];
+        int[] cs = new int[n];
+        List<Template> ts = new ArrayList<>();
+        int nc = 0, m = 0;
+        for (String t : settings.targets) {
+            if (Settings.isColor(t)) {
+                k[m] = KIND_COLOR;
+                idx[m++] = nc;
+                cs[nc++] = Settings.color(t);
+            } else {
+                Template tpl = Template.load(this, Settings.imageName(t));
+                if (tpl == null) continue;
+                k[m] = KIND_IMAGE;
+                idx[m++] = ts.size();
+                ts.add(tpl);
+            }
+        }
+        kind = Arrays.copyOf(k, m);
+        index = Arrays.copyOf(idx, m);
+        colors = Arrays.copyOf(cs, nc);
+        templates = ts;
+
+        cellCount = new int[nc * cells];
+        cellSumX = new int[nc * cells];
+        cellSumY = new int[nc * cells];
+        colorFound = new boolean[nc];
+        colorX = new float[nc];
+        colorY = new float[nc];
+        hits = new float[m * 2];
         hitCount = 0;
     }
 
@@ -183,8 +210,7 @@ public class CaptureService extends Service {
     void reloadSettings() {
         handler.post(() -> {
             settings = Settings.load(this);
-            templates = Template.loadAll(this);
-            allocate();
+            loadTargets();
         });
     }
 
@@ -196,18 +222,11 @@ public class CaptureService extends Service {
         });
     }
 
-    /** Adds the color at screen point (x, y) to the target list, then resumes tapping. */
+    /** Adds the color at screen point (x, y) as the lowest-priority target, then resumes tapping. */
     void pickAt(float x, float y) {
         handler.post(() -> {
             // Grab the newest frame (the pick layer is gone by now or nearly so).
-            Image img = reader.acquireLatestImage();
-            if (img != null) {
-                try {
-                    copyFrame(img);
-                } finally {
-                    img.close();
-                }
-            }
+            grabFrame();
             int color = -1;
             boolean added = false;
             if (frameValid) {
@@ -215,15 +234,9 @@ public class CaptureService extends Service {
                 int cy = Math.max(0, Math.min(capH - 1, (int) (y / toScreenY)));
                 int i = (cy * capW + cx) * 4;
                 color = ((frame[i] & 0xFF) << 16) | ((frame[i + 1] & 0xFF) << 8) | (frame[i + 2] & 0xFF);
-                added = true;
-                for (int c : settings.colors) if (c == color) added = false;
-                if (added) {
-                    int[] colors = java.util.Arrays.copyOf(settings.colors, settings.colors.length + 1);
-                    colors[colors.length - 1] = color;
-                    settings.colors = colors;
-                    settings.save(this);
-                    allocate();
-                }
+                String t = Settings.colorTarget(color);
+                added = !settings.targets.contains(t);
+                if (added) addTarget(t);
             }
             picking = false;
             frameValid = false;
@@ -232,18 +245,11 @@ public class CaptureService extends Service {
         });
     }
 
-    /** Saves the screen region (screen pixels) as a new image target, then resumes tapping. */
+    /** Saves the screen region (screen pixels) as the lowest-priority target, then resumes tapping. */
     void pickImage(float left, float top, float right, float bottom) {
         // Wait for a frame without the selection rectangle drawn on it.
         handler.postDelayed(() -> {
-            Image img = reader.acquireLatestImage();
-            if (img != null) {
-                try {
-                    copyFrame(img);
-                } finally {
-                    img.close();
-                }
-            }
+            grabFrame();
             int x0 = Math.max(0, (int) (left / toScreenX));
             int y0 = Math.max(0, (int) (top / toScreenY));
             int x1 = Math.min(capW, (int) Math.ceil(right / toScreenX));
@@ -251,11 +257,10 @@ public class CaptureService extends Service {
             boolean ok = false;
             if (frameValid && x1 - x0 >= 4 && y1 - y0 >= 4) {
                 try {
-                    Template.save(this, frame, capW, x0, y0, x1 - x0, y1 - y0);
-                    templates = Template.loadAll(this);
-                    allocate();
+                    String name = Template.save(this, frame, capW, x0, y0, x1 - x0, y1 - y0);
+                    addTarget(Settings.imageTarget(name));
                     ok = true;
-                } catch (java.io.IOException ignored) {
+                } catch (IOException ignored) {
                 }
             }
             picking = false;
@@ -263,6 +268,24 @@ public class CaptureService extends Service {
             TapService svc = TapService.instance;
             if (svc != null) svc.onImagePicked(ok);
         }, 250);
+    }
+
+    private void addTarget(String t) {
+        // Re-read first so priorities changed in the app since the last reload are kept.
+        settings = Settings.load(this);
+        settings.targets.add(t);
+        settings.save(this);
+        loadTargets();
+    }
+
+    private void grabFrame() {
+        Image img = reader.acquireLatestImage();
+        if (img == null) return;
+        try {
+            copyFrame(img);
+        } finally {
+            img.close();
+        }
     }
 
     /** Copies the image into `frame` as tightly packed RGBA. */
@@ -280,16 +303,43 @@ public class CaptureService extends Service {
         frameValid = true;
     }
 
-    /** Adds the centre of each template found in `frame` to hits (only the first unless tapEachColor). */
-    private void findImages() {
-        for (Template t : templates) {
-            if (matchTemplate(t) && !settings.tapEachColor) return;
+    /**
+     * Fills hits with the found targets in priority order; stops at the first one unless tapAll.
+     * The color pass and the frame copy are each done at most once, and only when needed.
+     */
+    private void findTargets(Image img) {
+        hitCount = 0;
+        boolean colorsDone = false, frameDone = false;
+        for (int i = 0; i < kind.length; i++) {
+            boolean found;
+            if (kind[i] == KIND_COLOR) {
+                if (!colorsDone) {
+                    findColors(img);
+                    colorsDone = true;
+                }
+                int j = index[i];
+                found = colorFound[j];
+                if (found) addHit(colorX[j], colorY[j]);
+            } else {
+                if (!frameDone) {
+                    copyFrame(img);
+                    frameDone = true;
+                }
+                found = matchTemplate(templates.get(index[i]));
+            }
+            if (found && !settings.tapAll) return;
         }
     }
 
+    private void addHit(float x, float y) {
+        hits[hitCount * 2] = x;
+        hits[hitCount * 2 + 1] = y;
+        hitCount++;
+    }
+
     /**
-     * Finds the position where the most sample points of t match (within tolerance).
-     * Coarse pass on every 2nd position with early exit, then a fine pass around the best.
+     * Finds the position where the most sample points of t match (within tolerance) and adds its
+     * centre to hits. Coarse pass on every 2nd position with early exit, then a 1px refinement.
      */
     private boolean matchTemplate(Template t) {
         int n = t.sx.length;
@@ -304,9 +354,7 @@ public class CaptureService extends Service {
         for (int y = Math.max(0, by - 1); y <= Math.min(maxY, by + 1); y++) {
             for (int x = Math.max(0, bx - 1); x <= Math.min(maxX, bx + 1); x++) tryAt(t, x, y, best);
         }
-        hits[hitCount * 2] = (best[1] + t.w / 2f) * toScreenX;
-        hits[hitCount * 2 + 1] = (best[2] + t.h / 2f) * toScreenY;
-        hitCount++;
+        addHit((best[1] + t.w / 2f) * toScreenX, (best[2] + t.h / 2f) * toScreenY);
         return true;
     }
 
@@ -327,8 +375,8 @@ public class CaptureService extends Service {
         best[2] = y;
     }
 
-    /** Adds to hits the centres of the densest patches of the target colors. */
-    private void findTarget(Image img) {
+    /** One pass over the image: for each color, the centre of its densest patch (colorFound/X/Y). */
+    private void findColors(Image img) {
         Image.Plane plane = img.getPlanes()[0];
         ByteBuffer buf = plane.getBuffer();
         int rowStride = plane.getRowStride();
@@ -336,7 +384,6 @@ public class CaptureService extends Service {
         int w = Math.min(img.getWidth(), capW), h = Math.min(img.getHeight(), capH);
         if (row == null || row.length < rowStride) row = new byte[rowStride];
 
-        int[] colors = settings.colors;
         int k = colors.length;
         int[] tr = new int[k], tg = new int[k], tb = new int[k];
         for (int j = 0; j < k; j++) {
@@ -347,7 +394,7 @@ public class CaptureService extends Service {
         int tol = settings.tolerance;
         int cols = (capW + CELL - 1) / CELL;
 
-        // Skip our own stop button so it is never tapped.
+        // Skip our own panel so it is never tapped.
         int exL = 0, exT = 0, exR = 0, exB = 0;
         TapService svc = TapService.instance;
         if (svc != null) {
@@ -357,9 +404,9 @@ public class CaptureService extends Service {
             exB = (int) Math.ceil(svc.btnBottom / toScreenY);
         }
 
-        java.util.Arrays.fill(cellCount, 0);
-        java.util.Arrays.fill(cellSumX, 0);
-        java.util.Arrays.fill(cellSumY, 0);
+        Arrays.fill(cellCount, 0);
+        Arrays.fill(cellSumX, 0);
+        Arrays.fill(cellSumY, 0);
 
         for (int y = 0; y < h; y += STEP) {
             buf.position(y * rowStride);
@@ -377,32 +424,26 @@ public class CaptureService extends Service {
                     cellCount[c]++;
                     cellSumX[c] += x;
                     cellSumY[c] += y;
-                    break; // first matching color wins
+                    break; // a pixel counts for the highest-priority color it matches
                 }
             }
         }
 
         int threshold = Math.max(1, settings.minHits) - 1;
-        if (settings.tapEachColor) {
-            for (int j = 0; j < k; j++) addBest(j * cells, (j + 1) * cells, threshold);
-        } else {
-            addBest(0, k * cells, threshold);
-        }
-    }
-
-    /** Adds the centre of the densest cell in [from, to) to hits, if it beats threshold. */
-    private void addBest(int from, int to, int threshold) {
-        int best = -1, bestCount = threshold;
-        for (int c = from; c < to; c++) {
-            if (cellCount[c] > bestCount) {
-                bestCount = cellCount[c];
-                best = c;
+        for (int j = 0; j < k; j++) {
+            int best = -1, bestCount = threshold;
+            for (int c = j * cells, end = c + cells; c < end; c++) {
+                if (cellCount[c] > bestCount) {
+                    bestCount = cellCount[c];
+                    best = c;
+                }
+            }
+            colorFound[j] = best >= 0;
+            if (best >= 0) {
+                colorX[j] = (cellSumX[best] / (float) bestCount + 0.5f) * toScreenX;
+                colorY[j] = (cellSumY[best] / (float) bestCount + 0.5f) * toScreenY;
             }
         }
-        if (best < 0) return;
-        hits[hitCount * 2] = (cellSumX[best] / (float) bestCount + 0.5f) * toScreenX;
-        hits[hitCount * 2 + 1] = (cellSumY[best] / (float) bestCount + 0.5f) * toScreenY;
-        hitCount++;
     }
 
     private void startForegroundCompat() {
